@@ -13,14 +13,16 @@
 - [0. 简短背景](#0-简短背景)
 - [1. 仓库目录树（两层）](#1-仓库目录树两层)
 - [2. 整体组件架构](#2-整体组件架构)
-- [3. 模块一：存储引擎 + Erasure Coding + Quorum](#模块-06-存储引擎--erasure-coding--quorum)
-- [4. 模块二：Healing 自愈机制（最高优先级）](#模块六healing-自愈机制最高优先级模块)
-- [5. 模块三：Replication（Bucket + Site）](#模块六replication-桶复制--站点复制)
-- [6. 模块四：Scanner + Life Cycle Manager](#模块-scanner--life-cycle-manager)
-- [7. 模块五：S3 API + IAM + Grid](#模块六minio-s3-api-层--iam--内部通信基础设施)
-- [8. 模块六（专题）：Rate Limit & Rate Control 横切机制](#8-模块六专题分析rate-limit-与-rate-control-横切机制)
-- [9. Design Patterns 汇总表](#8-design-patterns-汇总表)
-- [10. 评价与启发](#9-评价与启发)
+- [3. 模块一：存储引擎 + Erasure Coding + Quorum](#3-模块一存储引擎--erasure-coding--quorum)
+- [4. 模块二：Healing 自愈机制（最高优先级）](#4-模块二healing-自愈机制最高优先级)
+- [5. 模块三：Replication（Bucket + Site）](#5-模块三replicationbucket--site)
+- [6. 模块四：Scanner + Life Cycle Manager](#6-模块四scanner--life-cycle-manager)
+- [7. 模块五：S3 API 层 + IAM + Grid 内部通信](#7-模块五s3-api-层--iam--grid-内部通信)
+- [8. 模块六（专题分析）：Rate Limit 与 Rate Control 横切机制](#8-模块六专题分析rate-limit-与-rate-control-横切机制)
+  - [8.13 运维参数手册（环境变量 + mc 命令）](#13-运维参数手册环境变量--mc-命令)
+- [9. Design Patterns 汇总表](#9-design-patterns-汇总表)
+- [10. 评价与启发](#10-评价与启发)
+- [11. 阅读建议与扩展](#11-阅读建议与扩展)
 
 ---
 
@@ -28,7 +30,7 @@
 
 MinIO 是一款用 Go 实现的高性能、S3 兼容对象存储系统，AGPLv3 开源。**核心定位**："只做对象存储，把它做到极致"——与 Ceph 这种"对象+块+文件"统一存储相比，MinIO 牺牲了通用性换来性能与运维简单性，官方实测在 NVMe 集群上 PUT 吞吐 325 GiB/s、GET 400 GiB/s。
 
-**它解决什么问题？** 企业既需要 S3 API 兼容（生态、AI/ML 训练框架、湖仓引擎都已对齐 S3），又不愿被 AWS 锁定或承担数据出云成本。同类项目中，Ceph RGW 性能与运维双重劣势；SeaweedFS S3 兼容性弱（仅 56 测试通过 vs MinIO 的 382）；Garage 偏边缘场景；新兴的 RustFS 仍不成熟。MinIO 在 "S3 兼容 + 高性能 + 易部署" 这个三角中长期占据最佳点。
+**它解决什么问题？** 企业既需要 S3 API 兼容（生态、AI/ML 训练框架、湖仓引擎都已对齐 S3），又不愿被 AWS 锁定或承担数据出云成本。同类项目中，Ceph RGW 性能与运维双重劣势；SeaweedFS S3 兼容性弱（仅 56 测试通过 vs MinIO 号称 382，据 MinIO 官方公布）；Garage 偏边缘场景；新兴的 RustFS 仍不成熟。MinIO 在 "S3 兼容 + 高性能 + 易部署" 这个三角中长期占据最佳点。
 
 **为什么值得读它的代码？** 三层原因：(1) 它把 Reed-Solomon 纠删码做到了对象级而非卷级，这在工业界是极少见的设计；(2) 它实现了**完全去中心化**的 healing/replication 机制，没有 master 节点；(3) 它逐字实现了 S3 协议的所有边界情况，是学习 S3 兼容性的最佳样本。
 
@@ -46,7 +48,7 @@ minio/
 ├── Dockerfile / Dockerfile.release   # 容器镜像构建
 ├── README.md / SECURITY.md           # 项目文档
 │
-├── cmd/                              # ★ 主体代码（454 文件，~18.4 万行）
+├── cmd/                              # ★ 主体代码（453 .go 文件含 _test.go，~18.4 万行）
 │   │   --- 存储核心 ---
 │   ├── erasure-server-pool.go        #   多 pool 管理（横向扩展层）
 │   ├── erasure-sets.go               #   pool 内 set 路由（SipHash）
@@ -290,7 +292,7 @@ flowchart TB
 
 ---
 
-## 0. 阅读路线图
+### 0. 阅读路线图
 
 整个 MinIO 的存储栈是分四层组装起来的，**每一层只关心自己的事情**。从顶到底依次是：
 
@@ -310,7 +312,7 @@ flowchart TB
 
 ---
 
-## 1. 四层架构的职责切分
+### 1. 四层架构的职责切分
 
 ### 1.1 erasureServerPools：跨 pool 的横向扩展
 
@@ -425,7 +427,7 @@ flowchart TD
 
 ---
 
-## 2. Erasure Set 大小自动计算：GCD 算法
+### 2. Erasure Set 大小自动计算：GCD 算法
 
 这是 MinIO **"约定优于配置"**哲学最典型的体现。用户启动时只需要写一行命令：
 
@@ -495,7 +497,7 @@ RRS（Reduced Redundancy Storage）默认始终是 1（除单盘）。
 
 ---
 
-## 3. Erasure Set 选择算法：SipHash 一致性哈希
+### 3. Erasure Set 选择算法：SipHash 一致性哈希
 
 ### 3.1 三代分布算法的演进
 
@@ -549,7 +551,7 @@ flowchart LR
 
 ---
 
-## 4. Quorum 机制详解
+### 4. Quorum 机制详解
 
 Quorum 是 MinIO 一致性的灵魂。理解 quorum 才能理解为什么 MinIO 能"一边坏盘一边继续读写"。
 
@@ -636,7 +638,7 @@ writeQuorum := len(disks)/2 + 1
 
 ---
 
-## 5. PutObject 完整调用链
+### 5. PutObject 完整调用链
 
 ### 5.1 调用栈（17 层）
 
@@ -727,7 +729,7 @@ if globalStorageClass.ShouldInline(erasure.ShardFileSize(data.ActualSize()), opt
 
 ---
 
-## 6. GetObject 完整调用链
+### 6. GetObject 完整调用链
 
 ```mermaid
 sequenceDiagram
@@ -802,7 +804,7 @@ for readTrigger := range readTriggerCh {
 
 ---
 
-## 7. Bitrot 保护
+### 7. Bitrot 保护
 
 ### 7.1 设计目标
 
@@ -872,7 +874,7 @@ func (b *streamingBitrotWriter) Write(p []byte) (int, error) {
 
 ---
 
-## 8. xl.meta 文件格式（v2）
+### 8. xl.meta 文件格式（v2）
 
 ### 8.1 文件结构
 
@@ -942,7 +944,7 @@ readers[index] = newBitrotReader(disk, metaArr[index].Data, bucket, partPath, ..
 
 ---
 
-## 9. 多 Pool 架构与 free-space 路由
+### 9. 多 Pool 架构与 free-space 路由
 
 ### 9.1 选 pool 的算法（`cmd/erasure-server-pool.go:390-411, 417-480`）
 
@@ -993,7 +995,7 @@ flowchart TD
 
 ---
 
-## 10. 存储类别（Storage Class）
+### 10. 存储类别（Storage Class）
 
 ### 10.1 STANDARD vs REDUCED_REDUNDANCY
 
@@ -1031,7 +1033,7 @@ if parityDrives < 0 { parityDrives = er.defaultParityCount }
 
 ---
 
-## 11. 设计模式总结
+### 11. 设计模式总结
 
 | 模式 | 出现位置 | 作用 |
 |------|---------|------|
@@ -1047,7 +1049,7 @@ if parityDrives < 0 { parityDrives = er.defaultParityCount }
 
 ---
 
-## 12. 完整数据流：从 HTTP PUT 到磁盘字节
+### 12. 完整数据流：从 HTTP PUT 到磁盘字节
 
 我们以 16 盘 / EC:4 / 1 GiB 文件为例，梳理一遍**到底磁盘上变成了什么**。
 
@@ -1080,7 +1082,7 @@ CopyObject 的元数据更新（不变实际数据）就利用了这个：复制
 
 ---
 
-## 13. 文件覆盖率明细
+### 13. 文件覆盖率明细
 
 | 文件 | 行数 | 阅读情况 | 在本文出现 |
 |------|------|---------|------------|
@@ -1116,7 +1118,7 @@ CopyObject 的元数据更新（不变实际数据）就利用了这个：复制
 
 ---
 
-## 14. 写在最后：从本模块到下一模块
+### 14. 写在最后：从本模块到下一模块
 
 读到这里，你应该理解了 MinIO 怎么"把对象稳健地写下去"。但下一个问题立刻浮现——**如果一块盘真的坏了，那块盘上的数据怎么办？**
 
@@ -1138,7 +1140,7 @@ CopyObject 的元数据更新（不变实际数据）就利用了这个：复制
 
 ---
 
-## 1. 整体定位与设计哲学
+### 1. 整体定位与设计哲学
 
 ### 1.1 Healing 在 MinIO 架构中的地位
 
@@ -1179,7 +1181,7 @@ CopyObject 的元数据更新（不变实际数据）就利用了这个：复制
 
 ---
 
-## 2. Healing 触发路径全景图
+### 2. Healing 触发路径全景图
 
 MinIO 有 **5 种** Healing 触发路径，覆盖了从单对象损坏到整盘故障的所有场景。
 
@@ -1239,11 +1241,11 @@ flowchart TB
 | New Disk | `cmd/background-newdisks-heal-ops.go:559` | `monitorLocalDisksAndHeal` | 10s 心跳检测 |
 | Admin | `cmd/admin-handlers.go:1308` | `HealHandler` | 客户端主动 |
 | MRF | `cmd/mrf.go:218` | `mrfState.healRoutine` | 写入失败时入队 |
-| Read-Time | `cmd/erasure-object.go:402` | GetObject 路径检测到 errFileNotFound/errFileCorrupt | 读取时按需 |
+| Read-Time | `cmd/erasure-object.go:403` | GetObject 路径检测到 errFileNotFound/errFileCorrupt | 读取时按需 |
 
 ---
 
-## 3. 核心：单对象 Healing 详细流程
+### 3. 核心：单对象 Healing 详细流程
 
 `er.healObject()` 是整个模块的"心脏"，所有触发路径最终都会汇聚到此（`cmd/erasure-healing.go:295-684`）。
 
@@ -1382,7 +1384,7 @@ disk.RenameData(ctx, minioMetaTmpBucket, tmpID, partsMetadata[i], bucket, object
 
 ---
 
-## 4. Global Heal 调度器（背景扫描修复）
+### 4. Global Heal 调度器（背景扫描修复）
 
 `cmd/global-heal.go` 实现了背景扫描修复的核心循环，其入口是 `healErasureSet`，每个 erasure set 独立运行。
 
@@ -1471,7 +1473,7 @@ healing 时检查 lifecycle 规则：如果对象按 ILM 应该删除，**直接
 
 ---
 
-## 5. 新磁盘加入：Disk Replacement Heal
+### 5. 新磁盘加入：Disk Replacement Heal
 
 新磁盘加入是 healing 模块最复杂的场景，因为它涉及"零数据 → 完整数据"的批量回填。
 
@@ -1589,7 +1591,7 @@ sort.Slice(buckets, func(i, j int) bool {
 
 ---
 
-## 6. MRF（Most-Recently-Failed）：写入失败的兜底
+### 6. MRF（Most-Recently-Failed）：写入失败的兜底
 
 MRF 解决一个特殊场景：**写入时已满足 quorum（N/2+1 个 shard 写成功），但仍有部分盘写失败**。这些"局部失败"的对象需要后续修复。
 
@@ -1663,7 +1665,7 @@ if u.BitrotScan {
 
 ---
 
-## 7. Scanner ↔ Healing 协作：周期性主动巡检
+### 7. Scanner ↔ Healing 协作：周期性主动巡检
 
 ### 7.1 Scanner 触发 Healing 的两种方式
 
@@ -1764,7 +1766,7 @@ s.shouldHeal = func() bool {
 
 ---
 
-## 8. 并发控制：Healing 与正常 IO 的冲突处理
+### 8. 并发控制：Healing 与正常 IO 的冲突处理
 
 ### 8.1 dsync 命名空间锁
 
@@ -1810,7 +1812,7 @@ healing 在每个对象修复完成后调用此函数。如果当前 HTTP 请求
 
 ---
 
-## 9. Bitrot 检测如何触发 Healing
+### 9. Bitrot 检测如何触发 Healing
 
 ### 9.1 Bitrot 写入路径（写时打 hash）
 
@@ -1860,7 +1862,7 @@ if errors.Is(err, errFileCorrupt) && opts.ScanMode != madmin.HealDeepScan {
 
 ---
 
-## 10. Bucket Healing vs Object Healing
+### 10. Bucket Healing vs Object Healing
 
 ### 10.1 粒度差异
 
@@ -1892,7 +1894,7 @@ return z.s3Peer.HealBucket(ctx, bucket, opts)
 
 ---
 
-## 11. 设计模式（Design Patterns）
+### 11. 设计模式（Design Patterns）
 
 | 模式 | 代码位置 | 应用 |
 |------|---------|------|
@@ -1909,7 +1911,7 @@ return z.s3Peer.HealBucket(ctx, bucket, opts)
 
 ---
 
-## 12. 与 HDFS、Ceph healing 机制的对比
+### 12. 与 HDFS、Ceph healing 机制的对比
 
 ### 12.1 三方对比
 
@@ -1945,7 +1947,7 @@ return z.s3Peer.HealBucket(ctx, bucket, opts)
 
 ---
 
-## 13. 潜在问题与改进空间
+### 13. 潜在问题与改进空间
 
 ### 13.1 并发触发去重缺失
 
@@ -2012,7 +2014,7 @@ healing 仅限本 cluster 内部。Site Replication 出故障时无 healing 机�
 
 ---
 
-## 14. 与下一模块（Replication）的衔接
+### 14. 与下一模块（Replication）的衔接
 
 Healing 解决了**单集群内部数据完整性**的问题：磁盘坏、节点重启、bit 翻转都能自愈。但单集群本身的故障（机房断电、地域级灾难）超出了 healing 的能力范围。
 
@@ -2024,7 +2026,7 @@ Healing 解决了**单集群内部数据完整性**的问题：磁盘坏、节�
 
 ---
 
-## 15. 覆盖率明细
+### 15. 覆盖率明细
 
 | 文件 | 总行数 | 已读行范围 | 覆盖率 | 达标(≥90%) |
 |------|--------|-----------|--------|-----------|
@@ -2055,7 +2057,7 @@ Healing 解决了**单集群内部数据完整性**的问题：磁盘坏、节�
 ## 5. 模块三：Replication（Bucket + Site）
 
 
-## 0. 模块定位
+### 0. 模块定位
 
 前一模块 Healing 解决了**单集群内**的容错（盘宕、节点宕、bit-rot），但若整个数据中心整体宕机或被网络隔离呢？这就需要把数据复制到**远端集群**。MinIO 提供两层复制：
 
@@ -2068,7 +2070,7 @@ Healing 解决了**单集群内部数据完整性**的问题：磁盘坏、节�
 
 ---
 
-## 1. Bucket Replication
+### 1. Bucket Replication
 
 ### 1.1 全景：从一次 PUT 到对端落盘
 
@@ -2320,7 +2322,7 @@ func (c Config) FilterActionableRules(obj ObjectOpts) []Rule {
 
 每个版本独立复制。源端通过 `MinIOSourceVersionID` 头将源版本 ID 透传给目标，目标在 `PutObject` 时通过 `AdvancedPutOptions.SourceVersionID` 复用同一个 versionID，**保证两边版本号一致**。
 
-`replicateObject`（`bucket-replication.go:1192`）核心：
+`replicateObject`（声明在 `bucket-replication.go:1184`，下文片段位于 `:1192`）核心：
 ```go
 gr, err := objectAPI.GetObjectNInfo(ctx, bucket, object, nil, http.Header{},
     ObjectOptions{
@@ -2479,7 +2481,7 @@ type BucketTargetSys struct {
 
 ---
 
-## 2. Site Replication
+### 2. Site Replication
 
 ### 2.1 与 Bucket Replication 的本质区别
 
@@ -2790,7 +2792,7 @@ func (c *SiteReplicationSys) startResync(ctx, objAPI, peer PeerInfo) (madmin.SRR
 
 ---
 
-## 3. 关键决策流程图
+### 3. 关键决策流程图
 
 ### 3.1 Sync vs Async 复制决策
 
@@ -2870,7 +2872,7 @@ flowchart LR
 
 ---
 
-## 4. Design Patterns 与代码位置
+### 4. Design Patterns 与代码位置
 
 | 模式 | 位置 | 体现 |
 |------|------|------|
@@ -2894,7 +2896,7 @@ flowchart LR
 
 ---
 
-## 5. 一致性问题分析
+### 5. 一致性问题分析
 
 ### 5.1 已知一致性陷阱
 
@@ -2958,7 +2960,7 @@ Replication 与上一模块 Healing 在多个点交叉：
 
 ---
 
-## 6. 入口与控制面
+### 6. 入口与控制面
 
 ### 6.1 Bucket Replication HTTP Handlers (`bucket-replication-handlers.go`)
 
@@ -3008,7 +3010,7 @@ var (
 
 ---
 
-## 7. 度量与可观测性
+### 7. 度量与可观测性
 
 ### 7.1 Bucket Replication 度量
 
@@ -3035,7 +3037,7 @@ var (
 
 ---
 
-## 8. 关键代码定位速查
+### 8. 关键代码定位速查
 
 | 功能 | 文件 | 关键函数/类型 |
 |------|------|---------------|
@@ -3066,7 +3068,7 @@ var (
 
 ---
 
-## 9. 与其它模块的连接
+### 9. 与其它模块的连接
 
 ### 9.1 上承（Healing）
 
@@ -3082,7 +3084,7 @@ Healing 模块负责单集群内部的修复，但有些故障（target offline�
 
 ---
 
-## 10. 核心设计哲学总结
+### 10. 核心设计哲学总结
 
 1. **解耦控制面与数据面**：Site Replication 的 IAM/桶配置同步走 admin API（`madmin.AdminClient`），而对象数据复制走标准 S3 API（`minio-go`）。同步基础设施分离让复制逻辑更清晰。
 
@@ -3102,7 +3104,7 @@ Healing 模块负责单集群内部的修复，但有些故障（target offline�
 
 ---
 
-## 11. 覆盖率明细
+### 11. 覆盖率明细
 
 ### 11.1 已读文件（核心）
 
@@ -3172,7 +3174,7 @@ Healing 模块负责单集群内部的修复，但有些故障（target offline�
 
 > 上一篇 Replication 解决了"数据如何在站点间同步"。本篇讨论数据"在原地"的治理：过期清理、冷热分层、用量统计、损坏修复。这一切的驱动者是一个跑在后台的扫描器（Scanner），它就是 MinIO 集群的"眼睛"。
 
-## 0. 模块定位与叙事入口
+### 0. 模块定位与叙事入口
 
 ### 0.1 为什么需要 Scanner？
 
@@ -3218,7 +3220,7 @@ Replication 把数据"散播"到远端；Scanner 在本地"巡逻"——发现�
 | `internal/bucket/lifecycle/evaluator.go` | 156 | 多版本规则评估器 |
 | `internal/bucket/lifecycle/{rule,filter,expiration,transition,noncurrentversion,delmarker-expiration}.go` | ~1100 | 规则各部件 |
 
-## 1. Scanner：后台之眼
+### 1. Scanner：后台之眼
 
 ### 1.1 入口与生命周期
 
@@ -3338,7 +3340,7 @@ for {
 - `dataScannerCompactLeastObject = 500`：子树总对象 < 500 → 直接合并
 - `dataScannerCompactAtChildren = 10000`：递归子节点 > 10000 → 找最少的子树合并直到回到限度
 - `dataScannerCompactAtFolders = 2500`：单层子目录 > 2500 → 当前节点 compact
-- `dataScannerForceCompactAtFolders = 250000`：极端情况强制（连根都不豁免）
+- 极端情况由 `s.newCache.forceCompact(dataScannerCompactAtChildren)` 兜底（`data-scanner.go:373`，阈值 10000）
 
 关键设计：**Compaction 不是一次性结构调整，而是每个 cycle 都在重新评估**。如果某 prefix 之前 compact 了但下次发现对象数减少了（例如批量删除），下次扫描可能又拆开（"un-compact"）。因此 cache 是自适应的——和数据分布动态匹配。
 
@@ -3405,7 +3407,7 @@ type dynamicSleeper struct {
 - 对 ctx.Done() 敏感（server 退出时立刻返回）
 - 把"做事时间"内化进 sleep 计算 → 自动跟随磁盘速度调节，无需手动 tune
 
-## 2. Scanner ↔ Healing 协作
+### 2. Scanner ↔ Healing 协作
 
 Scanner 不亲自治愈，它只负责"发现"和"派单"：
 
@@ -3443,7 +3445,7 @@ sequenceDiagram
 
 **为什么是 1/1024？** 假设一个 cycle 1 分钟、对象 1 亿——1/1024 抽样后每 cycle 仅 ~10 万次 heal 调用，可控。同时 1024 个 cycle 后理论上覆盖全部对象（约 17 小时），符合"位腐败检测应每天一次"的 SLA。
 
-## 3. Scanner ↔ ILM 协作
+### 3. Scanner ↔ ILM 协作
 
 ### 3.1 整体时序
 
@@ -3556,7 +3558,7 @@ PutBucketLifecycle handler (`bucket-lifecycle-handlers.go:40`):
 
 `ExpiryUpdatedAt` 字段是 MinIO 扩展（不在 S3 标准里），用于 Replication 协调——副本端需要知道"过期规则在某时间被改了"，避免源端早过期、副本端还活着导致同步失败。
 
-## 4. ILM 规则评估：从 XML 到 Action
+### 4. ILM 规则评估：从 XML 到 Action
 
 ### 4.1 LifecycleConfiguration 数据结构
 
@@ -3713,7 +3715,7 @@ case DeleteVersionAction, DeleteRestoredVersionAction:
 
 合规模式下，对象有 Retention/LegalHold 时，ILM 必须让步。这是合规存储的硬性要求。
 
-## 5. Tier 存储分层
+### 5. Tier 存储分层
 
 ### 5.1 数据分层架构
 
@@ -3851,7 +3853,7 @@ os.Sweep()  // 内部判断：如果旧对象在 warm tier 且确认要清理 �
 
 这样保证版本顺序一致性的同时，避免了"早删元数据但远端孤儿"。
 
-## 6. Data Usage Cache：扫描的"账本"
+### 6. Data Usage Cache：扫描的"账本"
 
 ### 6.1 数据结构
 
@@ -3901,7 +3903,7 @@ err := objAPI.NSScanner(ctx, results, uint32(cycleInfo.current), scanMode)
 
 prefix-level 的 cache（`<bucket>/.usage-cache.bin`）只对 erasureServerPools 有效，单机模式直接返回空 map。`prefixUsageCache` 用 `cachevalue.Opts{ReturnLastGood: true, NoWait: true}` ——失败时返回旧值不阻塞，30 秒主动刷新。
 
-## 7. Batch Expire：与扫描解耦的"快进"
+### 7. Batch Expire：与扫描解耦的"快进"
 
 ### 7.1 为什么需要 batch-expire？
 
@@ -3955,7 +3957,7 @@ expire:
 
 简单说：**ILM 是 cron job，Batch 是 ad-hoc 任务**。两者用同样的底层 `DeleteObjects` 路径，互不干扰。
 
-## 8. ILM Audit：审计每一次生命周期动作
+### 8. ILM Audit：审计每一次生命周期动作
 
 `bucket-lifecycle-audit.go` 简短但关键。每次 ILM 触发的删除/转储都会在 audit log 中留下足够的字段供合规审计：
 
@@ -4000,7 +4002,7 @@ traceFn(event, tags, nil)
 
 `traceFn` 同时把信息推给 `madmin.TraceILM` 订阅者（mc trace 命令实时观察）。
 
-## 9. 设计模式与 AWS S3 ILM 对比
+### 9. 设计模式与 AWS S3 ILM 对比
 
 ### 9.1 体现的设计模式
 
@@ -4052,7 +4054,7 @@ traceFn(event, tags, nil)
 - **Tier 配置无版本化**：删除 tier、改 tier 的危险性高。生产中删 tier 之前必须确认所有引用此 tier 的对象都已经 RestoreObject 拉回或被 ILM 清掉，否则下次 GET 即报错。代码上没有"软删除"或"标记不可用"。
 - **Bloom filter 已废弃**：早期版本用 bloom filter 标记修改 prefix 加速二次扫描，现在文件名 `.bloomcycle.bin` 仅作 cycle 计数器使用。说明实测中 bloom filter 收益不明显（可能因为大多数 prefix 都被持续写入），团队选择移除复杂性。
 
-## 10. 一段代表性源码细读
+### 10. 一段代表性源码细读
 
 来一个浓缩了 Scanner-ILM 协作的代码段——`applyActions` (`data-scanner.go:1036`):
 
@@ -4133,7 +4135,7 @@ eventLoop:
 - **超量告警**：`alertExcessiveVersions` 检测单对象版本爆炸（默认阈值 100 版本或 1TiB 累计），发 `event.ObjectManyVersions` / `ObjectLargeVersions` 通知
 - **审计源标记**：所有动作都带 `lcEventSrc_Scanner` tag，便于审计日志区分触发路径
 
-## 11. 总结：Scanner + ILM 在 MinIO 全图中的位置
+### 11. 总结：Scanner + ILM 在 MinIO 全图中的位置
 
 把这一模块从故事链上看一遍：
 
@@ -4154,7 +4156,7 @@ eventLoop:
 
 下一模块进入 Object Lock 与合规存储，那里会看到 Scanner+ILM 如何与 Retention/LegalHold 协作，让"该删的不删，该删的真删"。
 
-## 12. 文件覆盖率明细
+### 12. 文件覆盖率明细
 
 | 文件 | 行数 | 阅读策略 | 覆盖率 |
 |------|------|---------|--------|
@@ -4207,7 +4209,7 @@ eventLoop:
 
 ---
 
-## 1. S3 API 层：MinIO 的"门脸"
+### 1. S3 API 层：MinIO 的"门脸"
 
 ### 1.1 路由设计：Path-style vs Virtual-host-style
 
@@ -4476,7 +4478,7 @@ stateDiagram-v2
 
 ---
 
-## 2. 认证与鉴权（Authentication & Authorization）
+### 2. 认证与鉴权（Authentication & Authorization）
 
 ### 2.1 认证类型枚举
 
@@ -4835,7 +4837,7 @@ LDAP 模式下 `usersSysType == LDAPUsersSysType`，行为与内置用户略不�
 
 ---
 
-## 3. 内部基础设施
+### 3. 内部基础设施
 
 ### 3.1 Grid：自研内部通信框架
 
@@ -5146,7 +5148,7 @@ type conn interface {
 
 ---
 
-## 4. Design Patterns 总结
+### 4. Design Patterns 总结
 
 模块层面用到的经典模式与位置：
 
@@ -5170,7 +5172,7 @@ type conn interface {
 
 ---
 
-## 5. 三大子系统的协同：一个完整请求的视角
+### 5. 三大子系统的协同：一个完整请求的视角
 
 让我们用一个 `s3.PutObject` 在分布式 Erasure 集群下的完整链路把所有子系统串起来：
 
@@ -5220,7 +5222,7 @@ sequenceDiagram
 
 ---
 
-## 6. 为什么这个架构是"对的"——深层原因
+### 6. 为什么这个架构是"对的"——深层原因
 
 ### 6.1 把 S3 协议当 Schema
 
@@ -5262,7 +5264,7 @@ Grid 的设计哲学是 **"信任内部网络但优化连接成本"**：
 
 ---
 
-## 7. 覆盖率明细
+### 7. 覆盖率明细
 
 > 本模块要求 ≥90% 覆盖率，下表列出关键文件的阅读情况。
 > "完整精读"指通读关键函数；"采样精读"指基于 grep 定位重点段落详读；"目录扫描"指仅读 grep 结构。
@@ -5343,7 +5345,7 @@ Grid 的设计哲学是 **"信任内部网络但优化连接成本"**：
 
 ---
 
-## 8. 收尾：MinIO 全栈视角
+### 8. 收尾：MinIO 全栈视角
 
 至此我们走完了 MinIO 的所有核心模块：
 
@@ -5382,7 +5384,7 @@ MinIO 没有共识算法（Paxos/Raft），没有事务，没有跨表 join—�
 
 ---
 
-## 1. 引言：为什么 Rate Control 值得单独分析
+### 1. 引言：为什么 Rate Control 值得单独分析
 
 MinIO 同时承担三类负载：
 
@@ -5449,7 +5451,7 @@ flowchart TB
 
 ---
 
-## 2. 第一层：入站 API 限流（硬阈值 / 防过载）
+### 2. 第一层：入站 API 限流（硬阈值 / 防过载）
 
 ### 2.1 `apiConfig` 总览
 
@@ -5571,7 +5573,7 @@ flowchart LR
 
 ---
 
-## 3. 第二层：后台任务节流（自适应背压）
+### 3. 第二层：后台任务节流（自适应背压）
 
 ### 3.1 `dynamicSleeper`：以任务时长为输入的反馈节流器
 
@@ -5760,7 +5762,7 @@ timeout.LogSuccess(elapsed)     // 成功：贡献真实耗时
 
 ---
 
-## 4. 第三层：跨集群带宽控制（令牌桶）
+### 4. 第三层：跨集群带宽控制（令牌桶）
 
 ### 4.1 `BandwidthMonitor` 全景
 
@@ -5923,7 +5925,7 @@ flowchart LR
 
 ---
 
-## 5. 第四层：配额（容量级 rate control）
+### 5. 第四层：配额（容量级 rate control）
 
 ### 5.1 `bucket-quota.go` 的总体设计
 
@@ -5983,7 +5985,7 @@ bucketStorageCache.InitOnce(10*time.Second,
 
 ---
 
-## 6. 限流层级总结表（从客户端到磁盘 IO）
+### 6. 限流层级总结表（从客户端到磁盘 IO）
 
 | 层 | 机制 | 配额单位 | 默认值 | 触达后客户端看到 | 是否热更新 | 文件:行 |
 |---|---|---|---|---|---|---|
@@ -6008,7 +6010,7 @@ bucketStorageCache.InitOnce(10*time.Second,
 
 ---
 
-## 7. 监控与可观测性
+### 7. 监控与可观测性
 
 ### 7.1 Prometheus 指标（v2）
 
@@ -6040,7 +6042,7 @@ bucketStorageCache.InitOnce(10*time.Second,
 
 ---
 
-## 8. 设计模式总结
+### 8. 设计模式总结
 
 | 模式 | 应用 | 备注 |
 |---|---|---|
@@ -6058,7 +6060,7 @@ bucketStorageCache.InitOnce(10*time.Second,
 
 ---
 
-## 9. 与业界对比
+### 9. 与业界对比
 
 | 系统 | 入站限流 | 后台节流 | 带宽控制 | 配额 |
 |---|---|---|---|---|
@@ -6078,7 +6080,7 @@ bucketStorageCache.InitOnce(10*time.Second,
 
 ---
 
-## 10. 真实使用建议
+### 10. 真实使用建议
 
 ### 10.1 何时应该手工设 `requests_max`
 
@@ -6121,7 +6123,7 @@ bucketStorageCache.InitOnce(10*time.Second,
 
 ---
 
-## 11. 不足与改进空间
+### 11. 不足与改进空间
 
 ### 11.1 maxClients 的 limitation
 
@@ -6152,7 +6154,7 @@ MinIO 的 rate control 哲学很务实：**每一层都尽可能简单（chan、
 
 ---
 
-## 12. 覆盖率明细表
+### 12. 覆盖率明细表
 
 | 文件 | 总行数 | 已读 | 覆盖率 | 备注 |
 |---|---|---|---|---|
@@ -6182,7 +6184,172 @@ MinIO 的 rate control 哲学很务实：**每一层都尽可能简单（chan、
 
 ---
 
-## 8. Design Patterns 汇总表
+### 13. 运维参数手册（环境变量 + mc 命令）
+
+> 把前面 4 层机制翻译成运维语言：**每层有哪些可调旋钮、默认值是多少、改它要敲哪个 `mc` 命令**。每条都标了源码 `path:line`，方便对照排错。
+>
+> **配置优先级**：env > `mc admin config set` > 内置默认值。源码统一模式见 `internal/config/api/api.go:239`：`env.Get(EnvX, kvs.GetWithDefault(X, DefaultKVS))` —— env 设了就用 env，否则用 mc-config，最后落到默认。容器化部署建议**不用 env 设动态参数**，避免重启才能改值；root 凭据等启动期 bootstrap 参数除外。
+
+### 13.1 L1 入站 API 限流（19 个旋钮）
+
+操作员在此层主要回答两个问题：(1) 单节点最多接多少并发 S3 请求？(2) 复制/transition/cleanup 等"前台触发的后台动作"分多少 worker？这层全部归在 `api` 子系统下，热更新友好（改完即生效，正在执行的请求按旧配置完成）。
+
+| 控制项 | 类型 | 名称 | 默认值 | 作用 | 源码引用 |
+|---|---|---|---|---|---|
+| 最大并发请求数（每节点） | env / mc-config | `MINIO_API_REQUESTS_MAX` / `api requests_max` | `0`（自动按 RAM 算） | 显式设值时是**集群总数**，运行时再除以节点数 | `internal/config/api/api.go:56`、`cmd/handler-api.go:127-150` |
+| 集群健康超时 | env / mc-config | `MINIO_API_CLUSTER_DEADLINE` / `api cluster_deadline` | `10s` | 节点间健康检查/分布式调用最长等待 | `internal/config/api/api.go:58`、`cmd/handler-api.go:115-119` |
+| CORS 允许的源 | env / mc-config | `MINIO_API_CORS_ALLOW_ORIGIN` / `api cors_allow_origin` | `*` | 浏览器跨域白名单 | `internal/config/api/api.go:59,38` |
+| 远程传输超时 | env / mc-config | `MINIO_API_REMOTE_TRANSPORT_DEADLINE` / `api remote_transport_deadline` | `2h` | 联邦/代理 transport 上限 | `internal/config/api/api.go:60,39` |
+| LIST quorum 策略 | env / mc-config | `MINIO_API_LIST_QUORUM` / `api list_quorum` | `strict` | `strict`/`optimal`/`reduced`/`disk`/`auto` | `internal/config/api/api.go:62,40` |
+| 复制优先级 | env / mc-config | `MINIO_API_REPLICATION_PRIORITY` / `api replication_priority` | `auto` | `slow`→50/`auto`→100/`fast`→500 worker | `internal/config/api/api.go:64`、`cmd/bucket-replication.go:1905-1915` |
+| 复制 worker 上限 | env / mc-config | `MINIO_API_REPLICATION_MAX_WORKERS` / `api replication_max_workers` | `500` | priority=fast 时的硬上限（1–500） | `internal/config/api/api.go:65,42` |
+| 大对象复制 worker 上限 | env / mc-config | `MINIO_API_REPLICATION_MAX_LRG_WORKERS` / `api replication_max_lrg_workers` | `10` | 处理 ≥128 MiB 对象的独立池（1–10） | `internal/config/api/api.go:66,43` |
+| Transition worker 数 | env / mc-config | `MINIO_API_TRANSITION_WORKERS` / `api transition_workers` | `100` | 生命周期 transition 到冷层的 worker 数 | `internal/config/api/api.go:61,45` |
+| 过期 multipart 清理周期 | env / mc-config | `MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL` / `api stale_uploads_cleanup_interval` | `6h` | 多久触发一次清理扫描 | `internal/config/api/api.go:68,46` |
+| 过期 multipart 阈值 | env / mc-config | `MINIO_API_STALE_UPLOADS_EXPIRY` / `api stale_uploads_expiry` | `24h` | 多久未完成的 multipart 视为过期 | `internal/config/api/api.go:69,47` |
+| 删除清理周期 | env / mc-config | `MINIO_API_DELETE_CLEANUP_INTERVAL` / `api delete_cleanup_interval` | `5m` | 永久删除 trash 中文件的周期 | `internal/config/api/api.go:70-71,48` |
+| O_DIRECT 写 | env / mc-config | `MINIO_API_ODIRECT` / `api odirect` | `on` | 是否对大对象写启用 O_DIRECT | `internal/config/api/api.go:72,50` |
+| 服务端 gzip | env / mc-config | `MINIO_API_GZIP_OBJECTS` / `api gzip_objects` | `off` | 是否对响应做 gzip | `internal/config/api/api.go:74,51` |
+| Root 凭据访问 | env / mc-config | `MINIO_API_ROOT_ACCESS` / `api root_access` | `on` | 是否允许 root 凭据走 S3 接口 | `internal/config/api/api.go:75,52` |
+| Bucket 通知同步发送 | env / mc-config | `MINIO_API_SYNC_EVENTS` / `api sync_events` | `off` | 通知同步发送（吞吐降低，丢失风险降低） | `internal/config/api/api.go:76,53` |
+| 单对象最大版本数 | env / mc-config | `MINIO_API_OBJECT_MAX_VERSIONS` / `api object_max_versions` | `MaxInt64` | 同 key 累计版本超过即拒 PUT | `internal/config/api/api.go:77-78,54` |
+| Root drive 阈值 | env | `MINIO_ROOTDRIVE_THRESHOLD_SIZE`（旧 `_ROOTDISK_`）| 未设 | 小于此阈值的盘视为系统盘并跳过 | `internal/config/constants.go:67-68`、`cmd/common-main.go:750-752` |
+| 服务冻结 | mc-cmd | `mc admin service freeze ALIAS` / `unfreeze ALIAS` | 关 | `globalServiceFreeze` 原子位，`maxClients` 入口处阻塞所有请求 | `cmd/admin-handlers.go:480-518`、`cmd/handler-api.go:315` |
+
+**已废弃**（仍可识别但被忽略）：`requests_deadline` / `MINIO_API_REQUESTS_DEADLINE`（早期"等 X 秒拿不到信号量就 503"，现已改为非阻塞 `default` 立即拒，`internal/config/api/api.go:84`）；`replication_workers` / `replication_failed_workers` / `expiry_workers`（被 `replication_priority` + `replication_max_workers` 取代，`:85-86`、`:202-208`）。
+
+```bash
+mc admin config get ALIAS api                                   # 查看（含 env override 标记）
+mc admin config set ALIAS api requests_max=8000                 # 调大并发上限（值为集群总数）
+mc admin config set ALIAS api replication_priority=fast         # 切换复制为 fast（500 worker / 8 MRF）
+mc admin service freeze ALIAS                                   # 临时冻结整个服务
+```
+
+### 13.2 L2 后台任务节流（scanner + heal）
+
+这层调的是 scanner、healing、delete-cleanup 等后台子系统的"占多少时间片"。Scanner 用预设档位 (`speed`) 一次性配齐 `Delay`/`MaxWait`/`Cycle`；healing 用一组独立的 IO/sleep 上限。
+
+| 控制项 | 类型 | 名称 | 默认值 | 作用 | 源码引用 |
+|---|---|---|---|---|---|
+| Scanner 速度档位 | env / mc-config | `MINIO_SCANNER_SPEED` / `scanner speed` | `default` | `fastest` 0/0/1s、`fast` 1/100ms/1m、`default` 2/1s/1m、`slow` 10/15s/1m、`slowest` 100/15s/30m | `internal/config/scanner/scanner.go:32,158-170` |
+| Scanner 空闲行为 | env / mc-config | `MINIO_SCANNER_IDLE_SPEED` / `scanner idle_speed` | `on`（继续 sleep） | `off` 时绕过 `dynamicSleeper`，scanner 永远全速跑 | `internal/config/scanner/scanner.go:35,139-146` |
+| 版本数告警阈值 | env / mc-config | `MINIO_SCANNER_ALERT_EXCESS_VERSIONS` / `scanner alert_excess_versions` | `100` | 单对象版本超过此数会进 audit 日志 | `internal/config/scanner/scanner.go:38,127-130` |
+| 子目录数告警阈值 | env / mc-config | `MINIO_SCANNER_ALERT_EXCESS_FOLDERS` / `scanner alert_excess_folders` | `50000` | 单 erasure set 单文件夹下子目录超此数告警 | `internal/config/scanner/scanner.go:41,133-136` |
+| Bitrot 扫描周期 | env / mc-config | `MINIO_HEAL_BITROTSCAN` / `heal bitrotscan` | `off` | `on`（连续）/`off`（关）/`Nm`（N≥1 月） | `internal/config/heal/heal.go:39,159-164` |
+| Healing 单对象 sleep 上限 | env / mc-config | `MINIO_HEAL_MAX_SLEEP` / `heal max_sleep` | `250ms` | healSleeper 的 `maxWait` | `internal/config/heal/heal.go:40,166-168` |
+| Healing 每秒 IO 上限 | env / mc-config | `MINIO_HEAL_MAX_IO` / `heal max_io` | `100` | dynamicSleeper 速率换算上限 | `internal/config/heal/heal.go:41,170-172` |
+| Healing 单盘 worker 数 | env / mc-config | `MINIO_HEAL_DRIVE_WORKERS` / `heal drive_workers` | 自动（按盘数） | 每磁盘并发 healer 数 | `internal/config/heal/heal.go:42,174-185` |
+| Healing 全局 worker 数 | env（内部） | `_MINIO_HEAL_WORKERS`（下划线前缀） | `GOMAXPROCS/2` | 覆盖 `newHealRoutine` 默认值，无 mc-config 入口 | `cmd/background-heal-ops.go:157-165` |
+| MRF healing factor | (硬编码) | — | `factor=5, maxWait=1s` | mrf.go 的 `healSleeper` | `cmd/mrf.go:213` |
+| Trash 清理 sleeper | (硬编码) | — | `factor=5, maxWait=25ms` | `deleteCleanupSleeper` | `cmd/globals.go:441` |
+| 过期 multipart 清理 sleeper | (硬编码) | — | `factor=5, maxWait=25ms` | `deleteMultipartCleanupSleeper` | `cmd/globals.go:444` |
+| 抽样 heal 概率 | (硬编码) | `healObjectSelectProb` | `1024`（即 1/1024） | scanner 每对象触发 shouldHeal 的概率 | `cmd/data-scanner.go:59` |
+| Scanner sleeper 默认实例 | (硬编码) | `scannerSleeper` | `factor=2, maxWait=1s` | 启动默认；运行时被 `scanner speed` 覆盖 | `cmd/data-scanner.go:66` |
+| 主动 heal | mc-cmd | `mc admin heal ALIAS[/BUCKET[/PREFIX]] --recursive` | — | 即时 healing；走 admin `/heal/{bucket}` 路由 | `cmd/admin-router.go` |
+
+**已废弃**（被 `speed` 覆盖）：`MINIO_SCANNER_DELAY` / `_CRAWLER_DELAY`（`scanner.go:48,50,176-184`）；`MINIO_SCANNER_MAX_WAIT` / `_CRAWLER_MAX_WAIT`（`:51-52,185-192`）；`MINIO_SCANNER_CYCLE`（`:49,193-201`）。
+
+```bash
+mc admin config set ALIAS scanner speed=slowest                              # 让 99% 时间给前台
+mc admin config set ALIAS scanner speed=fastest idle_speed=off               # 冷数据集群全速扫
+mc admin config set ALIAS heal bitrotscan=1m                                 # 每月一次 bitrot
+mc admin config set ALIAS heal max_io=50 max_sleep=500ms                     # 抑制 healing IO
+mc admin heal ALIAS/mybucket --recursive                                     # 主动修某 bucket
+```
+
+### 13.3 L3 跨集群带宽（per-target 令牌桶）
+
+这层是真正"上限式"的速率限制，基于 `golang.org/x/time/rate.Limiter` 令牌桶，per-`(bucket, ARN)` 一个独立桶。**没有 env / mc-config 直接调它**——限速值随 bucket-target 配置时携带，或站点复制场景由 `mc admin replicate update` 下发。
+
+| 控制项 | 类型 | 名称 | 默认值 | 作用 | 源码引用 |
+|---|---|---|---|---|---|
+| 单 bucket-target 带宽限速 | mc-cmd | `mc admin bucket remote add ALIAS/BUCKET URL --bandwidth=N[MGT]` | 无（不限速） | 设置 `target.BandwidthLimit`，集群总带宽 | `cmd/admin-bucket-handlers.go:236-249`、`cmd/bucket-targets.go:402-413`、`internal/bucket/bandwidth/monitor.go:196-207` |
+| 更新已存在 target 的限速 | mc-cmd | `mc admin bucket remote edit ALIAS/BUCKET --arn=ARN --bandwidth=N` | — | 同 handler，传 `update=true` | `cmd/admin-bucket-handlers.go:147,186-241`、`cmd/admin-router.go:334-336` |
+| 删除 target（同时清掉限速） | mc-cmd | `mc admin bucket remote rm ALIAS/BUCKET --arn=ARN` | — | `RemoveTarget` 调 `updateBandwidthLimit(..., 0)` | `cmd/bucket-targets.go:465`、`cmd/admin-router.go:337-339` |
+| Site-replication 默认带宽 | mc-cmd | `mc admin replicate update SITE --default-bandwidth=N` | 不限速 | 设到 `peer.DefaultBandwidth.Limit` | `cmd/site-replication.go:999-1019,4042,4171`、`cmd/admin-handlers-site-replication.go:407` |
+| 监控带宽（不是控制项） | mc-cmd | `mc admin bucket bandwidth ALIAS [BUCKETS...]` | — | 读 EWMA 报告 | `cmd/peer-rest-server.go:80,1034-1037`、`cmd/admin-handlers.go:1564,1581` |
+| 复制队列容量 | (硬编码) | worker 池 channel | `100000` | 上层入站缓冲；溢出转 MRF | `cmd/bucket-replication.go:1855-1864,1929-1932` |
+| 大对象阈值 | (硬编码) | `minLargeObjSize` | `128 MiB` | 超过此大小走独立 large worker 池 | `cmd/bucket-replication.go:2176,2197` |
+| 小对象 throttle 超时 | (硬编码) | `throttleDeadline` | `1h` | 小对象在限速队列等令牌的最长时间 | `cmd/bucket-replication.go:61,1326-1329,1612-1615` |
+
+**关键约束**：
+- **带宽下限 100 MB/s**：handler 中硬校验，`<100*1000*1000` 直接拒（`cmd/admin-bucket-handlers.go:246-249`）。
+- **限速值是集群总和**：`SetBandwidthLimit` 内部 `limit / NodeCount`（`internal/bucket/bandwidth/monitor.go:199`）。10 节点集群设 1 Gbps 后单节点 100 Mbps。
+- **per-(bucket, ARN) 独立桶**：同 bucket 配 N 个 ARN 即 N 个独立桶（`monitor.go:43,196-206`）。
+
+```bash
+mc admin bucket remote add ALIAS/mybucket https://target/bucket --service replication --bandwidth 500MB
+mc admin bucket remote edit ALIAS/mybucket --arn arn:minio:replication::xxx:bucket --bandwidth 1G
+mc admin replicate update SITE --default-bandwidth 2G
+mc admin bucket bandwidth ALIAS mybucket
+```
+
+### 13.4 L4 桶配额（唯一旋钮：硬配额）
+
+最简单的一层——仅一个旋钮：**桶级硬配额**。MinIO 已经移除了 fifo（软）配额，遇到旧配置直接拒绝并提示用 ILM 替代（`cmd/bucket-quota.go:94-96`）。配额检查依赖 scanner 写入的 `data-usage.bin`，最差有 `10s + scanner_cycle` 的滞后。
+
+| 控制项 | 类型 | 名称 | 默认值 | 作用 | 源码引用 |
+|---|---|---|---|---|---|
+| 桶硬配额 | mc-cmd | `mc admin bucket quota ALIAS/BUCKET --hard SIZE` | 无（不限） | 写入路径在 `enforceQuotaHard` 拦截 | `cmd/admin-bucket-handlers.go:52-105`、`cmd/admin-router.go:326-328`、`cmd/bucket-quota.go:103-133` |
+| 查询桶配额 | mc-cmd | `mc admin bucket quota ALIAS/BUCKET` | — | 读取持久化的 `quota.json` | `cmd/admin-bucket-handlers.go:108-139`、`cmd/admin-router.go:323-325` |
+| 清除桶配额 | mc-cmd | `mc admin bucket quota ALIAS/BUCKET --clear` | — | 同 PUT 接口，传空配置 | `cmd/admin-bucket-handlers.go:97-105` |
+| 配额缓存 TTL | (硬编码) | `bucketStorageCache` TTL | `10s` | 配额检查的用量数据缓存窗口；`ReturnLastGood` 容错 | `cmd/bucket-quota.go:46-62` |
+| 配额检查触发点 | (硬编码) | `enforceBucketQuotaHard` | — | 仅 PUT/CompleteMultipartUpload 调用，GET/HEAD/LIST 不触发 | `cmd/bucket-quota.go:135-140` |
+| 已废弃软配额 | (拒绝) | quota type `fifo` | — | 解析时直接报错并提示 `mc quota clear` + `mc ilm add` | `cmd/bucket-quota.go:94-96` |
+
+**注意事项**：
+- **永远预留 5–10% buffer**：因为 `10s + scanner_cycle`（`scanner speed=default` 时 1 分钟，`slowest` 时 30 分钟）的滞后窗口，配额过紧会出现"用量已经回落但仍被拒"或"瞬时超额"。
+- **scanner 挂时配额停止生效**：`cmd/bucket-quota.go:72-75` 会打 once-warning：`unable to retrieve usage information for bucket: ..., quota will not be enforced`。
+
+```bash
+mc admin bucket quota ALIAS/mybucket --hard 100GB        # 设 100 GB 硬配额
+mc admin bucket quota ALIAS/mybucket                     # 查询
+mc admin bucket quota ALIAS/mybucket --clear             # 清除
+```
+
+### 13.5 综合调优场景
+
+#### 场景 A：高吞吐 PUT 工作负载（NVMe + 万兆网，bulk-load）
+目标：所有资源给前台 PUT，scanner/heal 让到最低；配额是唯一硬墙。
+```bash
+mc admin config set ALIAS api requests_max=8000
+mc admin config set ALIAS scanner speed=slowest
+mc admin config set ALIAS heal max_io=10 max_sleep=1s
+mc admin config set ALIAS heal bitrotscan=off
+mc admin config set ALIAS api replication_priority=fast
+mc admin bucket quota ALIAS/data --hard 9TB
+```
+
+#### 场景 B：Healing 优先集群（刚扩容、有降级对象需要修复）
+目标：尽快修完降级对象，前台流量短期降级可接受。
+```bash
+mc admin config set ALIAS scanner speed=fast
+mc admin config set ALIAS heal drive_workers=8 max_io=500 max_sleep=10ms
+mc admin heal ALIAS --recursive
+mc admin config set ALIAS api requests_max=200
+```
+
+#### 场景 C：带宽受限的 DR 异地复制
+目标：不让 replication 占满有限的跨地域专线，前台读写带宽优先。
+```bash
+mc admin bucket remote edit ALIAS/critical --arn arn:minio:replication::abc:dr-bucket --bandwidth 200MB
+mc admin config set ALIAS api replication_priority=slow
+mc admin bucket bandwidth ALIAS critical
+```
+
+#### 场景 D：多租户共享集群（无 noisy neighbor 网关）
+MinIO 不内置租户级限流，通用做法：
+```bash
+mc admin config set ALIAS api requests_max=400
+mc admin bucket quota ALIAS/tenant-a --hard 5TB
+mc admin bucket quota ALIAS/tenant-b --hard 5TB
+mc admin config set ALIAS api cluster_deadline=5s
+```
+注：真正的 per-tenant rate limit 必须在前置网关（nginx `limit_req` / Envoy 限流过滤器）实现——MinIO `maxClients` 是节点级总池，无租户维度。
+
+---
+
+## 9. Design Patterns 汇总表
 
 > 跨 5 大模块汇总，去重后整理。**这张表是阅读源码时的"地图"——遇到任何复杂代码先去这里找它对应的设计模式，再去理解局部细节。**
 
@@ -6243,9 +6410,9 @@ MinIO 的 rate control 哲学很务实：**每一层都尽可能简单（chan、
 
 ---
 
-## 9. 评价与启发
+## 10. 评价与启发
 
-### 9.1 MinIO 做得对的地方
+### 10.1 MinIO 做得对的地方
 
 **(1) 对象级纠删码是工程奇迹**
 工业界绝大多数存储用卷级 EC（一整个 LUN/PG 共用 parity 配置）。MinIO 把 EC 下沉到对象级别——每个对象独立选择 parity 数。这听起来像"把全局优化变成局部决策"，但收益巨大：(a) 不同 storage class 可以共存于同一集群（STANDARD 用 EC:4，REDUCED_REDUNDANCY 用 EC:2）；(b) Healing 粒度从"一整盘"细化到"一个对象"，避免长时间锁住一整个 PG。代价是元数据成本（每对象一份 xl.meta），但用 inline data 优化抵消了大部分开销。
@@ -6260,9 +6427,9 @@ MinIO 的 Scanner / NewDisk / Admin / MRF / Read-Time 五条 healing 路径冗�
 MinIO 选择不用 gRPC 而自研 Grid framework，乍看是 NIH（Not Invented Here）综合症，深读代码后会发现合理：(a) 单 TCP/WebSocket 连接 + 应用层 mux，比 gRPC 的"每个 RPC 一个 HTTP/2 stream"省了大量握手；(b) msgpack 序列化比 protobuf 在小消息上更快；(c) HandlerID 注册表的 immutable 顺序保证了 rolling upgrade 兼容性。这是为高并发存储场景量身定制的协议。
 
 **(5) 把 S3 协议当作 schema 而不是接口**
-MinIO 不"兼容" S3，它**是** S3——所有错误码、边界条件、隐含约定都逐字实现。其他系统经常在边角处偷懒（"反正大多数客户端用不到"），MinIO 的 382/382 测试通过率是这种偏执的回报。
+MinIO 不"兼容" S3，它**是** S3——所有错误码、边界条件、隐含约定都逐字实现。其他系统经常在边角处偷懒（"反正大多数客户端用不到"），MinIO 据官方公布的 382/382 测试通过率是这种偏执的回报（数字来自 MinIO 官方对外宣传，本仓库内未发现独立可追溯的测试报告，发布前建议加上引用源）。
 
-### 9.2 真实存在的问题
+### 10.2 真实存在的问题
 
 **(1) `cmd/` 扁平化组织扛不住规模了**
 454 个文件全部平铺在 `cmd/` 目录下，单文件最多 6284 行（site-replication.go）。新人 onboarding 极困难，IDE 跳转性能堪忧。这种风格在小项目里没问题，但 MinIO 的体量已经超出了它的极限。**如果让我重新设计，至少应该按"功能子系统"拆分子目录**：`cmd/storage/`、`cmd/replication/`、`cmd/iam/` 等。
@@ -6282,7 +6449,7 @@ ILM 规则可能要 16 个 cycle 后才被执行（懒扫描节流）。对于"�
 **(6) Dangling 对象误删风险**
 `deleteIfDangling` 在某些边界场景（quorum 错误 + 部分版本）下可能误判为悬挂从而删除还能恢复的对象。MinIO 用了多重保护（lock + 检查 part 文件），但代码 review 时仍能找到边界 case。
 
-### 9.3 如果让我重新设计
+### 10.3 如果让我重新设计
 
 1. **按子系统拆 cmd/ 目录**——这是最低成本的改进。
 2. **为 IAM 引入增量同步协议**——参考 etcd raft watch 的思路，把"全量重载"改成"增量推送"。
@@ -6290,7 +6457,7 @@ ILM 规则可能要 16 个 cycle 后才被执行（懒扫描节流）。对于"�
 4. **统一后台任务调度器**——Healing、ILM、Replication、Scanner 各自有 worker pool 和调度逻辑，但都本质是"周期触发的有限并发任务"。可以抽象一个共用的 BackgroundJob framework 减少重复代码。
 5. **真正考虑跨地域同步的时钟问题**——引入 hybrid logical clock（HLC）或 version vector，避免依赖物理时钟。
 
-### 9.4 MinIO 系统性设计哲学
+### 10.4 MinIO 系统性设计哲学
 
 读完整个代码库，可以归纳出 MinIO 的几条贯穿全栈的设计原则：
 
@@ -6308,7 +6475,7 @@ MinIO 不是技术上最先进的存储系统（比如它没有 Ceph 的 CRUSH m
 
 ---
 
-## 10. 阅读建议与扩展
+## 11. 阅读建议与扩展
 
 **如果你只有 1 小时**：读 `docs/distributed/DESIGN.md` + 本报告的"整体架构"和"模块二（Healing）"两节。
 
