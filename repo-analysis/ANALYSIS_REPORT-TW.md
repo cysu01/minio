@@ -20,9 +20,11 @@
 - [7. 模組五：S3 API 層 + IAM + Grid 內部通訊](#7-模組五s3-api-層--iam--grid-內部通訊)
 - [8. 模組六（專題分析）：Rate Limit 與 Rate Control 橫切機制](#8-模組六專題分析rate-limit-與-rate-control-橫切機制)
   - [8.13 運維引數手冊（環境變數 + mc 命令）](#13-運維引數手冊環境變數--mc-命令)
-- [9. Design Patterns 彙總表](#9-design-patterns-彙總表)
-- [10. 評價與啟發](#10-評價與啟發)
-- [11. 閱讀建議與擴充套件](#11-閱讀建議與擴充套件)
+- [9. 資料安全：場景化資料丟失風險全景](#9-資料安全場景化資料丟失風險全景)
+- [10. 慢盤 (HDD) 部署的效能分析](#10-慢盤-hdd-部署的效能分析)
+- [11. Design Patterns 彙總表](#11-design-patterns-彙總表)
+- [12. 評價與啟發](#12-評價與啟發)
+- [13. 閱讀建議與擴充套件](#13-閱讀建議與擴充套件)
 
 ---
 
@@ -6349,7 +6351,205 @@ mc admin config set ALIAS api cluster_deadline=5s
 
 ---
 
-## 9. Design Patterns 彙總表
+## 9. 資料安全：場景化資料丟失風險全景
+
+> 把前 8 章建立的"程式碼層理解"翻譯成"運維語言"：在什麼操作 / 故障 / 誤配下，資料可能丟失？防護機制是什麼？最差能丟多少？
+>
+> 本章是面向 SRE / 運維的"風險手冊"。完整的 45 個場景與程式碼引用見 `drafts/09-dataloss.md`，本章只摘**最值得記的**。
+
+### 9.1 5 類觸發原因
+
+按"誰/什麼觸發"分類：
+
+| # | 類別 | 典型場景 | 影響範圍 |
+|---|------|---------|---------|
+| 1 | 客戶端取消 / 網路中斷 | 大物件 PUT 中途斷 | 本次操作 |
+| 2 | 服務端故障 / 程序崩潰 | `kill -9` / 整盤掉線 | in-flight 寫入 |
+| 3 | 配置錯誤 / 誤操作 | parity 設 EC:1、ILM `Days:1` 誤用 | 全叢集存量 |
+| 4 | 時序競爭 / 併發問題 | dangling 誤刪、site-replication LWW 衝突 | 單物件到全叢集 |
+| 5 | 已知 bug / 邊界情況 | dangling deletion race、IAM split brain | 取決於觸發頻率 |
+
+### 9.2 五個**最高優先順序**風險（永久資料丟失類）
+
+#### R1. **Dangling deletion race during disk replacement**（已知 bug）
+- **機制**：`cmd/erasure-healing.go:isObjectDangling:1046-1054` 用 `notFoundMetaErrs > parityBlocks` 判定 dangling 並刪除。如果同時換 ≥ parity 塊盤，換上的盤還沒 NewDisk-heal 完成時 scanner 掃到該 set，會在所有可見盤上刪除"看似 dangling 實際有效"的物件。
+- **量化**：12 盤 EC:4 叢集同時換 5 塊盤，NewDisk heal 整盤需 3-7 天。這視窗內 scanner 掃到的物件有理論可被誤刪風險。1 PB / 1 B-object 叢集 24h 視窗內約 1.4 億物件處於"理論可被誤刪"狀態。
+- **MinIO 防護**：多重檢查（IsValid + nonActionableMetaErrs + parity 校驗）使實際觸發率極低，但非零。
+- **緩解**：運維 SOP——單批次換盤 ≤ parity-1；換盤後立即 `mc admin heal --recursive`。程式碼改進：見 `drafts/09-dataloss.md` B-1。
+
+#### R2. **`MINIO_HEAL_BITROTSCAN` 預設 OFF**（預設配置即風險）
+- **機制**：`internal/config/heal/heal.go` 的 `DefaultKVS` 把 bitrotscan 設為 `off`。冷資料 silent corruption 永遠不主動發現，只能等客戶端 GET 觸發 read-time check 或 scanner 1/1024 抽樣命中。
+- **量化**：1 PB 資料 + 業界年均 ~3% silent corruption 率 = 年化約 30 TB 錯誤物件。冷資料如果一年不被讀，錯誤一直累積；連續 (parity+1) 個 part 都損壞即永久丟失。
+- **MinIO 防護**：僅 read-time check 兜底——但這要求該物件被 GET 才能發現。
+- **緩解**：**生產強制**：`mc admin config set ALIAS heal bitrotscan=1m`（每月一輪）。
+
+#### R3. **MRF 持久化是單盤 best-effort**（潛在 bug）
+- **機制**：`cmd/mrf.go:saveMRFEntries:145-152` 用 `for _, localDrive ... if err == nil { break }` 模式——只寫到第一塊成功的本地盤。如果該盤事後損壞，整個 100K 條 healing 佇列丟失。
+- **量化**：單盤損壞 → 100K 個 healing 任務丟失 → 必須依賴 Scanner 1/1024 抽樣補救，可能數天才發現遺漏。
+- **MinIO 防護**：Scanner / NewDisk / Read-Time 三路兜底（healing 5 路觸發的優勢在此體現）。
+- **緩解**：監控 `minio_node_drive_total_writes_total{api="MRF"}`。程式碼改進：寫 quorum 多盤（B-2）。
+
+#### R4. **storage_class parity 設得太低**（誤配）
+- **機制**：`mc admin config set ... storage_class standard=EC:1` 允許設到 1，等價於 RAID 0。
+- **量化**：任意 2 盤同時故障即資料丟失。
+- **MinIO 防護**：預設是 EC:4（在 `internal/config/storageclass/storage-class.go:354-368`），但允許顯式覆蓋。
+- **緩解**：始終保持 `parity ≥ EC:4`；納入配置審計。
+
+#### R5. **ILM `Days:1` 應用到舊桶**（誤操作）
+- **機制**：Scanner 掃到物件時按 lifecycle 評估，立即觸發刪除。
+- **量化**：100 萬物件一夜全沒；`.trash/` 持有期預設 5 分鐘，過後物理刪除。
+- **MinIO 防護**：scanner 節流（預設 1 分鐘週期）讓刪除速率自動慢；`.trash/` 5 分鐘緩衝。
+- **緩解**：生產應用任何 ILM 規則前必須 `mc ilm rule run --dry-run`；關鍵桶啟用 Object Lock + Compliance retention。
+
+### 9.3 風險等級矩陣
+
+按"機率 × 嚴重度"二維分類（45 個場景全集見 `drafts/09-dataloss.md`）：
+
+| | **臨時不可用** | **可恢復** | **靜默損壞** | **永久丟失** |
+|---|---|---|---|---|
+| **常見** | 客戶端斷 PUT、KMS 短掛 | multipart 遺忘、新寫入失敗入 MRF | — | — |
+| **偶發** | 單盤掉線、quota 撞頂 | 程序崩潰、併發寫競爭 | site-repl LWW 時鐘漂 | ILM 誤配、Object Lock 未開 |
+| **極少** | — | format.json 損壞 | bitrotscan=off 長期 | **R1, R3, R4, R5**, site split brain |
+
+**最危險三角**：極少 × 永久丟失格——R1（dangling race）、R3（MRF 單盤）、R4（EC:1）、R5（ILM 誤配）、site split brain。
+
+### 9.4 必須的運維 checklist（生產強制）
+
+| 項 | 命令 | 防護物件 |
+|---|---|---|
+| Storage class parity ≥ EC:4 | （預設即可，不要手動設 EC:1/2） | R4 |
+| 每月一次 bitrot scan | `mc admin config set ALIAS heal bitrotscan=1m` | R2 |
+| 關鍵桶 versioning + Object Lock | `mc retention set --default ... ALIAS/bucket` | R5 + 誤刪 |
+| 嚴格 NTP / chrony | OS 層配 | site-repl LWW |
+| 單批次換盤 ≤ parity-1 + 換後立即 heal | `mc admin heal ALIAS --recursive` | R1 |
+| 跨機櫃節點拓撲 | 部署時 | 整 set 故障 |
+| 監控 MRF 佇列 + healing pending | Prometheus rule | R3 |
+
+### 9.5 8 條程式碼改進建議（B-1 to B-8）
+
+詳見 `drafts/09-dataloss.md` 末尾。最高 ROI 三條：
+
+1. **B-1**：`isObjectDangling` 增加 `globalBackgroundHealState.isAnyDriveHealing(set)` 檢查——當該 set 有盤正在 heal 時禁止 deleteIfDangling
+2. **B-2**：MRF 持久化改為 quorum 多盤（min(N,3)），用類似 xl.meta 的多副本 + 時間戳排序
+3. **B-5**：Site replication 引入 hybrid logical clock（HLC），替代純 wall-clock LWW
+
+### 9.6 與第 10 章（HDD 效能）的銜接
+
+資料丟失風險與效能壓力是耦合的：HDD 叢集上 healing 慢（章節 10.3）→ R1 的視窗被拉長；HDD 上 IAM full reload 跑不完（章節 10.5）→ S-37 的記憶體高峰持續；HDD 上 bitrot scan 不能開 on（章節 10.4）→ R2 的暴露面更大。所以 HDD 叢集應該把 9.4 checklist 當作"更必須"，並把 chapter 10 的調參建議疊加。
+
+---
+
+## 10. 慢盤 (HDD) 部署的效能分析
+
+> 把前 8 章建立的"程式碼層理解"翻譯成"硬體語言"：MinIO 在 7200-RPM SATA HDD 上每個子系統會發生什麼？哪些預設值在 HDD 上是錯的？怎麼調？
+>
+> 完整的 8 節量化分析（包含詳細 IO 數學）見 `drafts/09-hdd-performance.md`，本章只摘**最值得記的**。
+
+### 10.1 基線與"程式碼裡隱含的 NVMe 假設"
+
+HDD 與 NVMe 的差距不在頻寬（一個數量級），而在 **IOPS（三個數量級）**：
+
+| 項 | HDD | NVMe | 差距 |
+|---|---|---|---|
+| 順序讀 | 150 MB/s | 3 GB/s | 20× |
+| 4K 隨機 IOPS | 80–150 | 400 K+ | **3000–5000×** |
+| 平均尋道 | 8–12 ms | <0.1 ms | 100× |
+
+程式碼裡 4 處明顯的 NVMe 假設：
+
+| 假設 | 程式碼 | 在 HDD 上的後果 |
+|---|---|---|
+| `MaxTimeout = 30s` | `internal/config/drive/drive.go:75` | 單 IO 30s 上限夠用但 margin 不大；冷 cache 大物件 read 接近上限 |
+| `scannerSleeper factor=2` | `cmd/data-scanner.go:66` | NVMe 上 sleep µs 級；HDD 上 sleep ms 級，scanner 有效 IO 時間被壓到 1/3 |
+| `numHealers = max(4, NRRequests/4)` | `cmd/global-heal.go:195-208` | HDD NRRequests=128 → numHealers=32；遠超 HDD 實際併發能力（4-8） |
+| `replication 100 worker` | `cmd/bucket-replication.go:1879` | 100 worker 同時 GET 源端 = HDD random IO 災難 |
+
+### 10.2 五個子系統的瓶頸一覽
+
+| 子系統 | 瓶頸型別 | HDD 上的典型表現 | 推薦檔位 |
+|---|---|---|---|
+| Scanner | random IO（readdir + stat） | 1 PB / 1 B-object 實際 cycle = **2-4 天**而非聲稱的 1 分鐘 | `speed=slow` 或 `slowest` |
+| ILM | piggy-back on scanner | `Days:1` 實際可能延後 1-2 個月生效 | 不依賴準時；用 `mc batch` |
+| Healing | random IO（每物件 N+1 seek） | 12 TB 整盤 heal = **3-7 天** | `max_io=50, drive_workers=4` |
+| Bitrot | sequential read（全資料掃描） | Deep scan 一輪 1 PB = **3-7 天** | `bitrotscan=1m` 或 `6m`，絕不 `on` |
+| Replication | random IO（源端 100 worker） | 小物件實際吞吐 ~6 MB/s（即便 10G 網路） | `replication_priority=slow` |
+
+### 10.3 三個最大的"配置陷阱"
+
+#### 陷阱 1：照搬 NVMe 教程把 `heal max_io` 設到 500
+- HDD 單盤 IOPS ~100，max_io=500 意味著 healing 100% 佔盤，前臺 latency 飆升
+- **必做**：`mc admin config set ALIAS heal max_io=50 max_sleep=500ms`
+
+#### 陷阱 2：開 `bitrotscan=on`
+- 持續 deep scan = scanner 佔 50-80% 盤 IO，前臺幾乎不可用
+- **必做**：`bitrotscan=1m`（每月一次）或最低 `bitrotscan=6m`，但絕不 `on`
+
+#### 陷阱 3：LDAP 大使用者量（>10 萬）+ HDD
+- IAM 全量 reload 週期 10 分鐘，100 萬 file × 10ms = **2.7 小時跑不完一輪**
+- **必做**：要麼用 etcd backend 替換 IAM 持久化，要麼把 `.minio.sys/` 掛到獨立 SSD
+
+### 10.4 HDD 叢集推薦配置（4 個 persona）
+
+#### Persona A：冷歸檔 (1 PB+, 寫少讀少, 全 HDD)
+```bash
+mc admin config set ALIAS scanner speed=slowest idle_speed=on
+mc admin config set ALIAS heal max_io=10 max_sleep=2s drive_workers=2 bitrotscan=6m
+mc admin config set ALIAS api transition_workers=10 replication_priority=slow
+```
+
+#### Persona B：溫資料被迫用 HDD
+```bash
+mc admin config set ALIAS scanner speed=slow
+mc admin config set ALIAS heal max_io=50 max_sleep=500ms drive_workers=4 bitrotscan=1m
+mc admin config set ALIAS api transition_workers=30 replication_priority=auto requests_max=200
+```
+
+#### Persona C：HDD + NVMe 混合
+- 多 pool 部署：NVMe pool 接收新寫入，30 天后 ILM transition 到 HDD pool
+- `.minio.sys/` 掛載到 NVMe（IAM、metadata、MRF 持久化都受益）
+
+#### Persona D：跨地域 DR (源 HDD)
+```bash
+mc admin config set ALIAS api replication_priority=slow replication_max_lrg_workers=5
+mc admin bucket remote edit ALIAS/critical --arn ... --bandwidth 100MB
+```
+
+### 10.5 HDD 專屬監控指標
+
+主報告 §8.7 監控章節沒覆蓋到的 HDD-aware 指標：
+
+| 指標 | 閾值 | 含義 |
+|---|---|---|
+| `minio_node_drive_perc_util` | >80% 持續 5min | 盤飽和 |
+| `minio_node_drive_writes_await` | >20ms | 寫延遲異常（HDD baseline ~10 ms） |
+| `minio_node_drive_waiting_io` | >10 持續 | IO 佇列堆積 |
+| `minio_node_scanner_objects_scanned` (rate) | <100 obj/s | scanner 速度過慢（預設 default 檔應有 ~600 obj/s）|
+| `minio_heal_objects_pending` | >10000 | healing queue 積壓 |
+
+### 10.6 誠實評價
+
+**MinIO 在 HDD 上做不好的事**：
+1. ILM 不能保證準時執行（日級規則可能延後周/月）
+2. `bitrotscan=on` 不可用（前臺不可用）
+3. `heal max_io ≥ 500` 不可用
+4. 大使用者 LDAP IAM 與 HDD 是**根本不相容**的組合
+5. Replication 100 worker 預設在 HDD 源端會引發 random IO 災難
+
+**MinIO 在 HDD 上做對的事**：
+1. scanner 節流可調 `speed=slowest` 讓出 99% 時間
+2. 大物件走獨立 worker 池，對 HDD 順序 read 友好
+3. healing 5 路觸發，scanner 慢也有 read-time 兜底
+4. 物件級 EC，heal 單位精細
+
+**總結**：MinIO 設計原點是 NVMe；HDD 是"被支援但不被最佳化"。可行但需要：(a) 接受所有後臺任務"很慢"；(b) 容量與吞吐預估打 0.3-0.5 折扣；(c) 不要照搬 NVMe 教程；(d) 監控 HDD 專屬指標。**純歸檔場景下 HDD MinIO 表現良好；高頻小物件 + 嚴格 SLA 場景下不適合，應換 NVMe**。
+
+### 10.7 與第 9 章（資料安全）的呼應
+
+HDD 上 healing 慢（10.2）→ §9.2 R1 的暴露視窗被拉長；HDD 上 bitrot scan 不能開 `on`（10.3 陷阱 2）→ §9.2 R2 的"冷資料 silent corruption"風險更大。HDD 叢集應把 §9.4 checklist 當作**更剛性**的要求，併疊加本章的調參建議。
+
+---
+
+## 11. Design Patterns 彙總表
 
 > 跨 5 大模組彙總，去重後整理。**這張表是閱讀原始碼時的"地圖"——遇到任何複雜程式碼先去這裡找它對應的設計模式，再去理解區域性細節。**
 
@@ -6410,9 +6610,9 @@ mc admin config set ALIAS api cluster_deadline=5s
 
 ---
 
-## 10. 評價與啟發
+## 12. 評價與啟發
 
-### 10.1 MinIO 做得對的地方
+### 12.1 MinIO 做得對的地方
 
 **(1) 物件級糾刪碼是工程奇蹟**
 工業界絕大多數儲存用卷級 EC（一整個 LUN/PG 共用 parity 配置）。MinIO 把 EC 下沉到物件級別——每個物件獨立選擇 parity 數。這聽起來像"把全域性最佳化變成區域性決策"，但收益巨大：(a) 不同 storage class 可以共存於同一叢集（STANDARD 用 EC:4，REDUCED_REDUNDANCY 用 EC:2）；(b) Healing 粒度從"一整盤"細化到"一個物件"，避免長時間鎖住一整個 PG。代價是後設資料成本（每物件一份 xl.meta），但用 inline data 最佳化抵消了大部分開銷。
@@ -6429,7 +6629,7 @@ MinIO 選擇不用 gRPC 而自研 Grid framework，乍看是 NIH（Not Invented 
 **(5) 把 S3 協議當作 schema 而不是介面**
 MinIO 不"相容" S3，它**是** S3——所有錯誤碼、邊界條件、隱含約定都逐字實現。其他系統經常在邊角處偷懶（"反正大多數客戶端用不到"），MinIO 據官方公佈的 382/382 測試透過率是這種偏執的回報（數字來自 MinIO 官方對外宣傳，本倉庫內未發現獨立可追溯的測試報告，釋出前建議加上引用源）。
 
-### 10.2 真實存在的問題
+### 12.2 真實存在的問題
 
 **(1) `cmd/` 扁平化組織扛不住規模了**
 454 個檔案全部平鋪在 `cmd/` 目錄下，單檔案最多 6284 行（site-replication.go）。新人 onboarding 極困難，IDE 跳轉效能堪憂。這種風格在小專案裡沒問題，但 MinIO 的體量已經超出了它的極限。**如果讓我重新設計，至少應該按"功能子系統"拆分子目錄**：`cmd/storage/`、`cmd/replication/`、`cmd/iam/` 等。
@@ -6449,7 +6649,7 @@ ILM 規則可能要 16 個 cycle 後才被執行（懶掃描節流）。對於"�
 **(6) Dangling 物件誤刪風險**
 `deleteIfDangling` 在某些邊界場景（quorum 錯誤 + 部分版本）下可能誤判為懸掛從而刪除還能恢復的物件。MinIO 用了多重保護（lock + 檢查 part 檔案），但程式碼 review 時仍能找到邊界 case。
 
-### 10.3 如果讓我重新設計
+### 12.3 如果讓我重新設計
 
 1. **按子系統拆 cmd/ 目錄**——這是最低成本的改進。
 2. **為 IAM 引入增量同步協議**——參考 etcd raft watch 的思路，把"全量過載"改成"增量推送"。
@@ -6457,7 +6657,7 @@ ILM 規則可能要 16 個 cycle 後才被執行（懶掃描節流）。對於"�
 4. **統一後臺任務排程器**——Healing、ILM、Replication、Scanner 各自有 worker pool 和排程邏輯，但都本質是"週期觸發的有限併發任務"。可以抽象一個共用的 BackgroundJob framework 減少重複程式碼。
 5. **真正考慮跨地域同步的時鐘問題**——引入 hybrid logical clock（HLC）或 version vector，避免依賴物理時鐘。
 
-### 10.4 MinIO 系統性設計哲學
+### 12.4 MinIO 系統性設計哲學
 
 讀完整個程式碼庫，可以歸納出 MinIO 的幾條貫穿全棧的設計原則：
 
@@ -6475,7 +6675,7 @@ MinIO 不是技術上最先進的儲存系統（比如它沒有 Ceph 的 CRUSH m
 
 ---
 
-## 11. 閱讀建議與擴充套件
+## 13. 閱讀建議與擴充套件
 
 **如果你只有 1 小時**：讀 `docs/distributed/DESIGN.md` + 本報告的"整體架構"和"模組二（Healing）"兩節。
 
